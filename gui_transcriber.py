@@ -29,7 +29,9 @@ class TranscriberApp:
         self.is_recording = False
         self.stop_event = threading.Event()
         self.audio_queue = queue.Queue()
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        self.result_queue = queue.Queue()  # Per risultati ordinati
+        self.executor = None  # Creato dinamicamente
+        self.chunk_counter = 0  # Contatore per ordinamento
         self.model = None
         self.current_model_name = ""
         self.log_file = ""
@@ -57,27 +59,38 @@ class TranscriberApp:
                 pass
 
     def record_audio_thread(self, mic, buffer_seconds):
+        """Cattura audio e lo etichetta con chunk_id e timestamp di cattura"""
         print(f"DEBUG: Start Recording Thread (Buffer: {buffer_seconds}s)")
         try:
             with mic.recorder(samplerate=SAMPLE_RATE) as recorder:
                 while not self.stop_event.is_set():
                     try:
+                        # Cattura timestamp PRIMA del recording (più accurato)
+                        capture_time = datetime.datetime.now()
                         data = recorder.record(numframes=SAMPLE_RATE * buffer_seconds)
-                        self.audio_queue.put(data)
+                        
+                        # Etichetta chunk con ID progressivo
+                        chunk_id = self.chunk_counter
+                        self.chunk_counter += 1
+                        
+                        # Metti in queue: (chunk_id, capture_time, audio_data)
+                        self.audio_queue.put((chunk_id, capture_time, data))
+                        
                     except Exception as e:
                         print(f"Error recording: {e}")
                         time.sleep(0.1)
         except Exception as e:
             print(f"Fatal recorder error: {e}")
 
-    def process_queue_thread(self, engine_mode, lang_code, whisper_lang, buffer_seconds):
-        print("DEBUG: Start Processing Thread")
+    def dispatcher_thread(self, engine_mode, lang_code, whisper_lang, buffer_seconds):
+        """Distribuisce chunk ai worker paralleli (NON BLOCCA!)"""
+        print("DEBUG: Start Dispatcher Thread (Parallel Processing)")
         prev_audio_chunk = np.array([], dtype='float32')
         overlap_samples = int(SAMPLE_RATE * (2.0 if engine_mode == "google" else 0))
 
-        while not self.stop_event.is_set():
+        while not self.stop_event.is_set() or not self.audio_queue.empty():
             try:
-                data = self.audio_queue.get(timeout=buffer_seconds + 3)
+                chunk_id, capture_time, data = self.audio_queue.get(timeout=1)
             except queue.Empty:
                 continue
 
@@ -102,14 +115,55 @@ class TranscriberApp:
                  prev_audio_chunk = np.array([], dtype='float32')
                  continue
 
-            timestamp = self.get_timestamp()
+            # Usa timestamp di cattura (non di elaborazione!)
+            timestamp = capture_time.strftime("%Y-%m-%d %H:%M:%S")
             
+            # SOTTOMETTI AL POOL (non blocca!)
             if engine_mode == "google":
-                self.executor.submit(self.task_google, data_to_process, lang_code, timestamp)
+                future = self.executor.submit(self.process_chunk_google, data_to_process.copy(), lang_code, timestamp)
             else:
-                self.task_whisper(data_to_process, whisper_lang, timestamp)
+                future = self.executor.submit(self.process_chunk_whisper, data_to_process.copy(), whisper_lang, timestamp)
+            
+            # Aggiungi alla result queue con chunk_id per ordinamento
+            self.result_queue.put((chunk_id, future))
+        
+        print("DEBUG: Dispatcher finished")
+    
+    def result_collector_thread(self):
+        """Raccoglie risultati dai worker e li mostra NELL'ORDINE CORRETTO"""
+        print("DEBUG: Start Result Collector Thread")
+        expected_chunk_id = 0
+        pending_results = {}  # Buffer per risultati fuori ordine
+        
+        while not self.stop_event.is_set() or not self.result_queue.empty() or len(pending_results) > 0:
+            try:
+                chunk_id, future = self.result_queue.get(timeout=0.5)
+                
+                # Attendi completamento worker (può essere già finito!)
+                try:
+                    results = future.result(timeout=30)
+                except Exception as e:
+                    results = [f"[ERROR CHUNK {chunk_id}]: {e}"]
+                
+                # Salva risultato
+                pending_results[chunk_id] = results
+                
+                # Mostra tutti i chunk consecutivi disponibili
+                while expected_chunk_id in pending_results:
+                    for line in pending_results[expected_chunk_id]:
+                        if line:  # Salta linee vuote
+                            self.update_ui(line)
+                    
+                    del pending_results[expected_chunk_id]
+                    expected_chunk_id += 1
+                    
+            except queue.Empty:
+                continue
+        
+        print("DEBUG: Result Collector finished")
 
-    def task_google(self, audio_data, lang_code, timestamp):
+    def process_chunk_google(self, audio_data, lang_code, timestamp):
+        """Worker per Google Speech (thread-safe, ritorna risultati)"""
         recognizer = sr.Recognizer()
         audio_int16 = (audio_data * 32767).astype(np.int16)
         audio_bytes = audio_int16.tobytes()
@@ -117,22 +171,25 @@ class TranscriberApp:
 
         try:
             text = recognizer.recognize_google(audio_source, language=lang_code)
-            self.update_ui(f"[{timestamp}] {text}")
+            return [f"[{timestamp}] {text}"]
         except sr.UnknownValueError:
-            pass
+            return []  # Nessun testo riconosciuto
         except Exception as e:
-            self.update_ui(f"[ERROR GOOGLE]: {e}")
+            return [f"[ERROR GOOGLE]: {e}"]
 
-    def task_whisper(self, audio_data, lang_code, timestamp):
+    def process_chunk_whisper(self, audio_data, lang_code, timestamp):
+        """Worker per Whisper (thread-safe, ritorna risultati)"""
         try:
             if self.model:
                 segments, _ = self.model.transcribe(audio_data, beam_size=5, language=lang_code, vad_filter=True)
                 parts = [s.text.strip() for s in segments if s.text.strip()]
                 text = " ".join(parts)
                 if text:
-                    self.update_ui(f"[{timestamp}] {text}")
+                    return [f"[{timestamp}] {text}"]
+                return []
+            return []
         except Exception as e:
-            self.update_ui(f"[ERROR WHISPER]: {e}")
+            return [f"[ERROR WHISPER]: {e}"]
 
     def update_ui(self, text):
         self.log_to_file(text)
@@ -140,15 +197,16 @@ class TranscriberApp:
             try:
                 # Definisci la coroutine async per l'update UI
                 async def _do_update():
-                    color = ft.Colors.GREEN_400
-                    if "[ERROR" in text: color = ft.Colors.RED_400
-                    if ">>>" in text: color = ft.Colors.YELLOW_200
+                    # Aggiungi nuova riga al TextField
+                    if self.txt_output.value:
+                        self.txt_output.value += "\n" + text
+                    else:
+                        self.txt_output.value = text
                     
-                    self.txt_output.controls.append(ft.Text(text, color=color, selectable=True, size=15, font_family="Consolas"))
-                    
-                    # Keep logs manageable
-                    if len(self.txt_output.controls) > 500:
-                        self.txt_output.controls.pop(0)
+                    # Keep logs manageable (limita a ultime 500 righe)
+                    lines = self.txt_output.value.split("\n")
+                    if len(lines) > 500:
+                        self.txt_output.value = "\n".join(lines[-500:])
                     
                     self.page.update()
                 
@@ -174,7 +232,7 @@ class TranscriberApp:
             w_model = "small.en"
             w_buffer = 4
 
-        if engine == "Whisper (Local)":
+        if "Whisper" in engine:
             if self.current_model_name != w_model:
                 self.update_ui(f"Loading Whisper Model ({w_model})... Please wait.")
                 try:
@@ -186,9 +244,13 @@ class TranscriberApp:
                     return
             current_buffer = w_buffer
             mode = "whisper"
+            # Whisper: 3 worker paralleli per CPU multi-core
+            num_workers = 3
         else:
             current_buffer = 10 
             mode = "google"
+            # Google: 4 worker per gestire rate limiting API
+            num_workers = 4
 
         target_mic = None
         try:
@@ -213,33 +275,54 @@ class TranscriberApp:
             return
 
         self.update_ui(f"--- STARTED ({mode.upper()} - {lang} - {target_mic.name}) ---")
+        self.update_ui(f">>> Parallel Processing: {num_workers} workers")
         
+        # Reset queues e contatori
         while not self.audio_queue.empty():
             self.audio_queue.get()
+        while not self.result_queue.empty():
+            self.result_queue.get()
+        self.chunk_counter = 0
+
+        # Crea pool di worker paralleli
+        self.executor = ThreadPoolExecutor(max_workers=num_workers, thread_name_prefix="TranscribeWorker")
 
         self.stop_event.clear()
         self.is_recording = True
         
+        # Thread 1: Recording (cattura audio)
         t_rec = threading.Thread(target=self.record_audio_thread, args=(target_mic, current_buffer))
         t_rec.daemon = True
         t_rec.start()
         
-        t_proc = threading.Thread(target=self.process_queue_thread, args=(mode, l_google, l_whisper, current_buffer))
-        t_proc.daemon = True
-        t_proc.start()
+        # Thread 2: Dispatcher (distribuisce ai worker)
+        t_disp = threading.Thread(target=self.dispatcher_thread, args=(mode, l_google, l_whisper, current_buffer))
+        t_disp.daemon = True
+        t_disp.start()
+        
+        # Thread 3: Result Collector (raccoglie risultati ordinati)
+        t_collect = threading.Thread(target=self.result_collector_thread)
+        t_collect.daemon = True
+        t_collect.start()
 
     def stop_transcription(self):
         if not self.is_recording: return
         self.stop_event.set()
         self.is_recording = False
+        
+        # Chiudi pool di worker
+        if self.executor:
+            self.executor.shutdown(wait=True, cancel_futures=False)
+            self.executor = None
+        
         self.update_ui("--- STOPPED ---")
 
 def main(page: ft.Page):
     page.title = "Live Transcriber Pro"
     page.theme_mode = ft.ThemeMode.DARK
-    page.window_width = 800
-    page.window_height = 850
-    page.padding = 20
+    page.window_width = 1400
+    page.window_height = 1100
+    page.padding = 15
     
     app = TranscriberApp()
     app.page = page
@@ -248,26 +331,26 @@ def main(page: ft.Page):
     
     img_robot = ft.Image(
         src="robot_static.png",
-        width=180,
-        height=180,
+        width=140,
+        height=140,
         fit="cover",
-        scale=1.4,
+        scale=1.3,
     )
     
     robot_container = ft.Container(
         content=img_robot,
-        width=170,
-        height=170,
-        border_radius=ft.border_radius.all(85),
+        width=130,
+        height=130,
+        border_radius=ft.border_radius.all(65),
         clip_behavior=ft.ClipBehavior.HARD_EDGE,
-        border=ft.border.all(3, ft.Colors.BLUE_GREY_800),
-        shadow=ft.BoxShadow(spread_radius=1, blur_radius=15, color=ft.Colors.BLACK),
+        border=ft.border.all(2, ft.Colors.BLUE_GREY_800),
+        shadow=ft.BoxShadow(spread_radius=1, blur_radius=10, color=ft.Colors.BLACK),
     )
 
     # Orologio sincronizzato con Windows
     clock_text = ft.Text(
         value=datetime.datetime.now().strftime("%H:%M:%S"),
-        size=20,
+        size=18,
         weight="bold",
         color=ft.Colors.CYAN_400,
         text_align=ft.TextAlign.CENTER
@@ -288,9 +371,9 @@ def main(page: ft.Page):
     
     threading.Thread(target=clock_update_thread, daemon=True).start()
 
-    header = ft.Text("Live Transcriber Pro", size=30, weight="bold", color=ft.Colors.BLUE_200)
+    header = ft.Text("Live Transcriber Pro", size=26, weight="bold", color=ft.Colors.BLUE_200)
 
-    dd_device = ft.Dropdown(label="Audio Source (Loopback)", width=450)
+    dd_device = ft.Dropdown(label="Audio Source (Loopback)", expand=True)
     
     def refresh_devices(e=None):
         try:
@@ -330,30 +413,35 @@ def main(page: ft.Page):
     dd_engine = ft.Dropdown(
         label="Engine",
         options=[
-            ft.dropdown.Option("Google (Online)"),
-            ft.dropdown.Option("Whisper (Local)"),
+            ft.dropdown.Option("Google (indicated for English)"),
+            ft.dropdown.Option("Whisper (indicated for Português Brasil)"),
         ],
-        value="Whisper (Local)",
+        value="Whisper (indicated for Português Brasil)",
         expand=True
     )
 
-    # Output Area: ListView
-    txt_output = ft.ListView(
-        expand=True,
-        spacing=5,
-        padding=10,
-        auto_scroll=True,
+    # Output Area: TextField multilinea per selezione nativa del testo (LARGO E ALTO!)
+    txt_output = ft.TextField(
+        value="",
+        multiline=True,
+        read_only=True,
+        min_lines=25,
+        max_lines=60,
+        text_size=14,
+        bgcolor=ft.Colors.BLACK12,
+        color=ft.Colors.GREEN_400,
+        border_color=ft.Colors.BLUE_GREY_700,
+        focused_border_color=ft.Colors.BLUE_400,
+        text_style=ft.TextStyle(font_family="Consolas"),
+        expand=True,  # Espande orizzontalmente
     )
     app.txt_output = txt_output
     
-    # Contenitore per dare lo stile console
+    # Contenitore con dimensioni FORZATE per garantire visibilità
     log_container = ft.Container(
         content=txt_output,
-        border=ft.border.all(1, ft.Colors.BLUE_GREY_700),
-        bgcolor=ft.Colors.BLACK12,
-        border_radius=5,
-        expand=True,
-        padding=5
+        height=650,  # ALTEZZA FORZATA - 650px garantiti!
+        expand=True,  # Espande orizzontalmente per usare tutto lo spazio
     )
 
     def btn_start_click(e):
@@ -370,7 +458,11 @@ def main(page: ft.Page):
             dd_engine.disabled = True
             btn_refresh.disabled = True
             
-            txt_output.controls.append(ft.Text(f">>> Initializing {dd_engine.value}... Please wait...", color=ft.Colors.YELLOW_200))
+            # Aggiungi messaggio di inizializzazione
+            if txt_output.value:
+                txt_output.value += f"\n>>> Initializing {dd_engine.value}... Please wait..."
+            else:
+                txt_output.value = f">>> Initializing {dd_engine.value}... Please wait..."
             page.update()
             
             def start_bg():
@@ -385,7 +477,8 @@ def main(page: ft.Page):
             btn_stop.text = "STOPPING..."
             btn_stop.disabled = True
             
-            txt_output.controls.append(ft.Text("\n>>> STOP REQUESTED... Finishing last chunk & closing threads...\n", color=ft.Colors.ORANGE_300))
+            # Aggiungi messaggio di stop
+            txt_output.value += "\n>>> STOP REQUESTED... Finishing last chunk & closing threads..."
             page.update()
             
             def stop_bg():
@@ -407,7 +500,7 @@ def main(page: ft.Page):
             threading.Thread(target=stop_bg).start()
 
     def btn_clear_click(e):
-        txt_output.controls.clear()
+        txt_output.value = ""
         page.update()
 
     def btn_open_logs_click(e):
@@ -436,7 +529,20 @@ def main(page: ft.Page):
         expand=True
     )
 
+    def btn_copy_all_click(e):
+        if txt_output.value:
+            page.set_clipboard(txt_output.value)
+            # Feedback visivo temporaneo
+            btn_copy_all.text = "✓ Copied!"
+            page.update()
+            def reset_btn():
+                time.sleep(1.5)
+                btn_copy_all.text = "Copy All"
+                page.update()
+            threading.Thread(target=reset_btn, daemon=True).start()
+    
     btn_clear = ft.TextButton("Clear Log", on_click=btn_clear_click, icon=ft.Icons.CLEAR_ALL)
+    btn_copy_all = ft.TextButton("Copy All", on_click=btn_copy_all_click, icon=ft.Icons.COPY_ALL)
     btn_open_logs = ft.TextButton("Open Logs Folder", on_click=btn_open_logs_click, icon=ft.Icons.FOLDER_OPEN)
 
     page.add(
@@ -445,7 +551,7 @@ def main(page: ft.Page):
             ft.Container(expand=True),
             ft.Column([
                 robot_container,
-                ft.Container(height=10),
+                ft.Container(height=5),
                 clock_text
             ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
             btn_refresh
@@ -453,16 +559,15 @@ def main(page: ft.Page):
         
         ft.Row([dd_device]),
         ft.Row([dd_lang, dd_engine]),
-        ft.Divider(),
-        log_container, # Uso il container, non la listview nuda
-        ft.Row([btn_open_logs, ft.Container(expand=True), btn_clear]),
-        ft.Divider(),
+        log_container, # CAMPO PRINCIPALE - 600px garantiti!
+        ft.Text("💡 Select text with mouse + Ctrl+C, or 'Copy All'", 
+                size=10, 
+                color=ft.Colors.CYAN_600, 
+                italic=True,
+                text_align=ft.TextAlign.CENTER),
+        ft.Row([btn_open_logs, ft.Container(expand=True), btn_copy_all, btn_clear]),
         ft.Row([btn_start, btn_stop], spacing=20),
-        ft.Container(
-            content=ft.Text("Logs saved automatically to text files.", size=12, color=ft.Colors.GREY_500, text_align=ft.TextAlign.CENTER),
-            padding=10,
-            alignment=ft.Alignment(0, 0)
-        )
+        ft.Text("Logs saved to text files automatically", size=10, color=ft.Colors.GREY_500, text_align=ft.TextAlign.CENTER)
     )
 
 if __name__ == "__main__":
