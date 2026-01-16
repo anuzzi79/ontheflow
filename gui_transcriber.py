@@ -111,12 +111,19 @@ class TranscriberApp:
             else:
                 data_to_process = mono_data
 
-            if np.max(np.abs(data_to_process)) < 0.0001:
-                 prev_audio_chunk = np.array([], dtype='float32')
-                 continue
-
             # Usa timestamp di cattura (non di elaborazione!)
             timestamp = capture_time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # Check se audio è silenzioso
+            if np.max(np.abs(data_to_process)) < 0.0001:
+                prev_audio_chunk = np.array([], dtype='float32')
+                # IMPORTANTE: Crea future "vuoto" per mantenere ordine sequenziale!
+                from concurrent.futures import Future
+                empty_future = Future()
+                empty_future.set_result([])  # Risultato vuoto (nessun testo)
+                self.result_queue.put((chunk_id, empty_future))
+                print(f"DEBUG: Chunk {chunk_id} SKIPPED (silence) but placeholder added")
+                continue
             
             # SOTTOMETTI AL POOL (non blocca!)
             if engine_mode == "google":
@@ -126,6 +133,19 @@ class TranscriberApp:
             
             # Aggiungi alla result queue con chunk_id per ordinamento
             self.result_queue.put((chunk_id, future))
+            current_queue_size = self.result_queue.qsize()
+            print(f"DEBUG: Chunk {chunk_id} submitted to pool (queue size: {current_queue_size})")
+            
+            # Warning se queue troppo alta (collo di bottiglia!)
+            if current_queue_size > 3:
+                print(f"⚠️ WARNING: Queue size {current_queue_size} > 3 - Processing bottleneck detected!")
+                if current_queue_size > 6:
+                    print(f"🔴 CRITICAL: Queue size {current_queue_size} > 6 - Workers overloaded!")
+                
+                # Back-pressure: rallenta recording se queue troppo piena
+                if current_queue_size > 8:
+                    print(f"🛑 BACK-PRESSURE: Pausing recording for 2s to let workers catch up...")
+                    time.sleep(2)  # Pausa per dare tempo ai worker di recuperare
         
         print("DEBUG: Dispatcher finished")
     
@@ -141,12 +161,20 @@ class TranscriberApp:
                 
                 # Attendi completamento worker (può essere già finito!)
                 try:
-                    results = future.result(timeout=30)
+                    results = future.result(timeout=45)  # Timeout 45s - aumentato per gestire carichi alti
+                except TimeoutError:
+                    print(f"WARNING: Chunk {chunk_id} timeout dopo 45s - SKIPPED")
+                    results = [f"[⚠️ CHUNK {chunk_id} TIMEOUT - Skipped]"]
                 except Exception as e:
-                    results = [f"[ERROR CHUNK {chunk_id}]: {e}"]
+                    print(f"ERROR: Chunk {chunk_id} failed with: {type(e).__name__}: {e}")
+                    results = [f"[❌ CHUNK {chunk_id} ERROR: {type(e).__name__}]"]
                 
                 # Salva risultato
                 pending_results[chunk_id] = results
+                
+                # Avvisa se troppi chunk in attesa (possibile blocco)
+                if len(pending_results) > 5:
+                    print(f"WARNING: {len(pending_results)} chunks waiting (expecting #{expected_chunk_id})")
                 
                 # Mostra tutti i chunk consecutivi disponibili
                 while expected_chunk_id in pending_results:
@@ -156,6 +184,7 @@ class TranscriberApp:
                     
                     del pending_results[expected_chunk_id]
                     expected_chunk_id += 1
+                    print(f"DEBUG: Chunk {expected_chunk_id - 1} displayed (pending: {len(pending_results)})")
                     
             except queue.Empty:
                 continue
@@ -164,32 +193,40 @@ class TranscriberApp:
 
     def process_chunk_google(self, audio_data, lang_code, timestamp):
         """Worker per Google Speech (thread-safe, ritorna risultati)"""
-        recognizer = sr.Recognizer()
-        audio_int16 = (audio_data * 32767).astype(np.int16)
-        audio_bytes = audio_int16.tobytes()
-        audio_source = sr.AudioData(audio_bytes, SAMPLE_RATE, 2)
-
         try:
-            text = recognizer.recognize_google(audio_source, language=lang_code)
-            return [f"[{timestamp}] {text}"]
-        except sr.UnknownValueError:
-            return []  # Nessun testo riconosciuto
+            recognizer = sr.Recognizer()
+            audio_int16 = (audio_data * 32767).astype(np.int16)
+            audio_bytes = audio_int16.tobytes()
+            audio_source = sr.AudioData(audio_bytes, SAMPLE_RATE, 2)
+
+            try:
+                text = recognizer.recognize_google(audio_source, language=lang_code)
+                return [f"[{timestamp}] {text}"]
+            except sr.UnknownValueError:
+                return []  # Nessun testo riconosciuto
+            except sr.RequestError as e:
+                print(f"Google API Error: {e}")
+                return [f"[⚠️ Google API Error - check internet connection]"]
         except Exception as e:
-            return [f"[ERROR GOOGLE]: {e}"]
+            print(f"Google Worker Crash: {type(e).__name__}: {e}")
+            return [f"[❌ Google Processing Failed]"]
 
     def process_chunk_whisper(self, audio_data, lang_code, timestamp):
         """Worker per Whisper (thread-safe, ritorna risultati)"""
         try:
-            if self.model:
-                segments, _ = self.model.transcribe(audio_data, beam_size=5, language=lang_code, vad_filter=True)
-                parts = [s.text.strip() for s in segments if s.text.strip()]
-                text = " ".join(parts)
-                if text:
-                    return [f"[{timestamp}] {text}"]
-                return []
+            if not self.model:
+                print("WARNING: Whisper model not loaded!")
+                return [f"[⚠️ Model Not Loaded]"]
+            
+            segments, _ = self.model.transcribe(audio_data, beam_size=5, language=lang_code, vad_filter=True)
+            parts = [s.text.strip() for s in segments if s.text.strip()]
+            text = " ".join(parts)
+            if text:
+                return [f"[{timestamp}] {text}"]
             return []
         except Exception as e:
-            return [f"[ERROR WHISPER]: {e}"]
+            print(f"Whisper Worker Error: {type(e).__name__}: {e}")
+            return [f"[❌ Whisper Processing Failed]"]
 
     def update_ui(self, text):
         self.log_to_file(text)
@@ -224,8 +261,8 @@ class TranscriberApp:
         if lang == "Português":
             l_google = "pt-BR"
             l_whisper = "pt"
-            w_model = "small"
-            w_buffer = 12
+            w_model = "tiny"  # Soluzione Ibrida: tiny model per velocità
+            w_buffer = 10  # Compromesso: 10s per bilanciare velocità e accuracy
         else:
             l_google = "en-US"
             l_whisper = "en"
@@ -244,8 +281,8 @@ class TranscriberApp:
                     return
             current_buffer = w_buffer
             mode = "whisper"
-            # Whisper: 3 worker paralleli per CPU multi-core
-            num_workers = 3
+            # Whisper: 8 worker paralleli per CPU multi-core (auto-scaling per evitare colli di bottiglia)
+            num_workers = 8
         else:
             current_buffer = 10 
             mode = "google"
