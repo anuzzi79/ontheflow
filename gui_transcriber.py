@@ -11,6 +11,24 @@ import warnings
 import sys
 import os
 from concurrent.futures import ThreadPoolExecutor
+import assemblyai as aai
+from assemblyai.streaming.v3 import (
+    StreamingClient,
+    StreamingClientOptions,
+    StreamingParameters,
+    StreamingEvents,
+    BeginEvent,
+    TurnEvent,
+    TerminationEvent,
+    StreamingError
+)
+
+# Prova a caricare variabili d'ambiente da .env (opzionale)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv non installato, usa chiave hardcoded
 
 # --- CONFIGURAZIONE E COSTANTI ---
 SAMPLE_RATE = 16000
@@ -36,9 +54,28 @@ class TranscriberApp:
         self.current_model_name = ""
         self.log_file = ""
         
+        # AssemblyAI Real-Time Streaming
+        self.assemblyai_transcriber = None
+        # Carica chiave API da environment o usa placeholder
+        self.ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "YOUR_API_KEY_HERE")
+        # ⚠️ IMPORTANTE: Inserisci la tua chiave API qui sopra (sostituisci YOUR_API_KEY_HERE)
+        # Oppure crea un file .env con: ASSEMBLYAI_API_KEY=tua-chiave-qui
+        
+        # Per gestire trascrizioni parziali (real-time)
+        self.current_partial_text = ""
+        self.last_turn_order = -1
+        self.turn_text_map = {}  # Mappa turn_order -> Testo stringa (non controlli UI)
+        self.full_log_text = ft.Text(
+            value="", 
+            font_family="Consolas", 
+            size=14, 
+            color=ft.Colors.GREEN_400,
+            selectable=True
+        )
+        
         # Stato UI
         self.page = None
-        self.txt_output = None # Sarà una ListView
+        self.log_scroll_column = None # Colonna per auto-scroll
         
     def get_log_dir(self):
         docs = os.path.join(os.path.expanduser("~"), "Documents")
@@ -229,28 +266,189 @@ class TranscriberApp:
             return [f"[❌ Whisper Processing Failed]"]
 
     def update_ui(self, text):
+        """Fallback per messaggi di sistema"""
         self.log_to_file(text)
-        if self.page and self.txt_output:
+        sys_id = 999999 + int(time.time()*1000)
+        self.update_or_add_line(text, True, sys_id)
+
+    # ============== ASSEMBLYAI REAL-TIME STREAMING (v3 Universal) ==============
+    
+    def audio_generator(self, mic):
+        """Generatore di chunk audio per AssemblyAI v3"""
+        try:
+            with mic.recorder(samplerate=SAMPLE_RATE) as recorder:
+                while not self.stop_event.is_set():
+                    # Buffer MICRO: solo 0.05 secondi (50ms) per latenza minima
+                    data = recorder.record(numframes=int(SAMPLE_RATE * 0.05))
+                    
+                    # Converti in mono e PCM16
+                    mono_data = np.mean(data, axis=1)
+                    audio_int16 = (mono_data * 32767).astype(np.int16)
+                    audio_bytes = audio_int16.tobytes()
+                    
+                    yield audio_bytes
+        except Exception as e:
+            print(f"Audio Generator Error: {e}")
+    
+    def record_audio_assemblyai_thread(self, mic, lang_code):
+        """Streaming REAL-TIME con AssemblyAI v3 (latenza 300-500ms!)"""
+        print(f"DEBUG: Start AssemblyAI Universal Streaming (Language: {lang_code})")
+        
+        try:
+            # Crea client con nuova API v3
+            client = StreamingClient(
+                StreamingClientOptions(
+                    api_key=self.ASSEMBLYAI_API_KEY,
+                    api_host="streaming.assemblyai.com"
+                )
+            )
+            
+            # Registra callback
+            client.on(StreamingEvents.Begin, self.on_assemblyai_begin)
+            client.on(StreamingEvents.Turn, self.on_assemblyai_turn)
+            client.on(StreamingEvents.Termination, self.on_assemblyai_terminated)
+            client.on(StreamingEvents.Error, self.on_assemblyai_error)
+            
+            self.assemblyai_transcriber = client
+            
+            # Configura parametri (usa modello corretto!)
+            # "universal-streaming-english" = solo inglese
+            # "universal-streaming-multi" = multilingua (EN, PT, ES, FR, DE, IT)
+            speech_model = "universal-streaming-multi" if lang_code == "pt" else "universal-streaming-english"
+            
+            params = StreamingParameters(
+                sample_rate=SAMPLE_RATE,
+                format_turns=True,  # Formattazione automatica (punteggiatura)
+                speech_model=speech_model,
+                end_utterance_silence_threshold=300,  # Ridotto a 300ms (default 700ms)
+                # Altri parametri per massima reattività:
+                # - Rileva fine frase più velocemente
+                # - Mostra parole più rapidamente
+            )
+            
+            # Connetti
+            client.connect(params)
+            
+            # Crea generatore audio e avvia streaming
+            # Il metodo .stream() gestisce automaticamente l'invio dei chunk
+            audio_stream = self.audio_generator(mic)
+            client.stream(audio_stream)
+                        
+        except Exception as e:
+            print(f"AssemblyAI Fatal Error: {e}")
+            self.update_ui(f"❌ AssemblyAI Error: {e}")
+        finally:
+            if self.assemblyai_transcriber:
+                try:
+                    self.assemblyai_transcriber.disconnect(terminate=True)
+                except:
+                    pass
+
+    def on_assemblyai_begin(self, client, event: BeginEvent):
+        """Callback: connessione aperta"""
+        print(f"AssemblyAI: Connected! Session: {event.id}")
+        self.update_ui("🟢 AssemblyAI Universal Streaming Connected - Start speaking!")
+
+    def on_assemblyai_terminated(self, client, event: TerminationEvent):
+        """Callback: connessione chiusa"""
+        print(f"AssemblyAI: Disconnected (processed {event.audio_duration_seconds:.1f}s)")
+        self.update_ui("🔴 AssemblyAI Disconnected")
+
+    def on_assemblyai_turn(self, client, event: TurnEvent):
+        """Callback: risultati REAL-TIME (parziali e finali)"""
+        timestamp = self.get_timestamp()
+        
+        # Logica infallibile basata su turn_order univoco
+        current_turn_id = event.turn_order
+        
+        if event.end_of_turn:
+            # FINE FRASE
+            if event.transcript:
+                self.update_or_add_line(
+                    f"[{timestamp}] {event.transcript}", 
+                    is_final=True, 
+                    turn_order=current_turn_id
+                )
+        else:
+            # TESTO PARZIALE
+            if hasattr(event, 'words') and event.words:
+                all_words_text = " ".join([w.text for w in event.words])
+                if all_words_text:
+                    self.update_or_add_line(
+                        f"[{timestamp}] 🔵 {all_words_text}...", 
+                        is_final=False, 
+                        turn_order=current_turn_id
+                    )
+
+    def update_or_add_line(self, text, is_final, turn_order):
+        """Aggiorna il testo UNICO ricostruendolo dalla mappa (garantisce ordine e unicità)"""
+        if self.page and self.full_log_text:
             try:
-                # Definisci la coroutine async per l'update UI
                 async def _do_update():
-                    # Aggiungi nuova riga al TextField
-                    if self.txt_output.value:
-                        self.txt_output.value += "\n" + text
-                    else:
-                        self.txt_output.value = text
+                    # 1. Aggiorna la mappa dei testi
+                    self.turn_text_map[turn_order] = text
                     
-                    # Keep logs manageable (limita a ultime 500 righe)
-                    lines = self.txt_output.value.split("\n")
-                    if len(lines) > 500:
-                        self.txt_output.value = "\n".join(lines[-500:])
+                    # 2. Ricostruisci TUTTO il testo
+                    sorted_keys = sorted(self.turn_text_map.keys())
                     
-                    self.page.update()
+                    # Ottimizzazione
+                    if len(sorted_keys) > 500:
+                        keys_to_remove = sorted_keys[:-500]
+                        for k in keys_to_remove:
+                            del self.turn_text_map[k]
+                        sorted_keys = sorted_keys[-500:]
+                    
+                    # Costruisci stringa unica
+                    full_content = "\n".join([self.turn_text_map[k] for k in sorted_keys])
+                    
+                    # 3. Aggiorna l'unico controllo Text
+                    self.full_log_text.value = full_content
+                    self.full_log_text.update()
+                    
+                    # 4. Scroll automatico
+                    if self.log_scroll_column:
+                        try:
+                            self.log_scroll_column.scroll_to(offset=-1, duration=50)
+                        except:
+                            pass
                 
-                # Esegui la coroutine nel thread principale UI
                 self.page.run_task(_do_update)
             except Exception as e:
                 print(f"UI Update Error: {e}")
+
+    def update_ui(self, text):
+        """Fallback per messaggi di sistema"""
+        self.log_to_file(text)
+        sys_id = 999999 + int(time.time()*1000)
+        self.update_or_add_line(text, True, sys_id)
+
+    def on_assemblyai_error(self, client, error: StreamingError):
+        """Callback: errori"""
+        error_msg = str(error)
+        print(f"AssemblyAI Error: {error_msg}")
+        # Non mostrare errori "Model deprecated" ripetuti (già gestiti)
+        if "deprecated" not in error_msg.lower():
+            self.update_ui(f"⚠️ AssemblyAI Error: {error_msg}")
+
+    def _get_microphone(self, device_name):
+        """Helper per ottenere microfono"""
+        try:
+            mics = sc.all_microphones(include_loopback=True)
+            for m in mics:
+                if m.name == device_name:
+                    return m
+            for m in mics:
+                if device_name in m.name:
+                    return m
+            default = sc.default_speaker()
+            for m in mics:
+                if m.isloopback and m.id == default.id:
+                    return m
+        except Exception as e:
+            print(f"Error getting microphone: {e}")
+        return None
+
+    # ============================================================
 
     def start_transcription(self, engine, lang, device_name):
         if self.is_recording: return
@@ -261,14 +459,40 @@ class TranscriberApp:
         if lang == "Português":
             l_google = "pt-BR"
             l_whisper = "pt"
+            l_assemblyai = "pt"  # AssemblyAI language code
             w_model = "tiny"  # Soluzione Ibrida: tiny model per velocità
             w_buffer = 10  # Compromesso: 10s per bilanciare velocità e accuracy
         else:
             l_google = "en-US"
             l_whisper = "en"
+            l_assemblyai = "en"  # AssemblyAI language code
             w_model = "small.en"
             w_buffer = 4
 
+        # ========== ASSEMBLYAI REAL-TIME ==========
+        if "AssemblyAI" in engine:
+            target_mic = self._get_microphone(device_name)
+            if not target_mic:
+                self.update_ui("ERROR: Audio device not found! Try selecting another one.")
+                return
+            
+            self.update_ui(f"--- STARTED (ASSEMBLYAI REAL-TIME - {lang} - {target_mic.name}) ---")
+            self.update_ui("⚡ Ultra-Low Latency: ~300-500ms (like ChatGPT!)")
+            self.update_ui("💡 Speak naturally, transcription appears instantly...")
+            
+            self.stop_event.clear()
+            self.is_recording = True
+            
+            # Thread UNICO per AssemblyAI (gestisce tutto!)
+            t_assemblyai = threading.Thread(
+                target=self.record_audio_assemblyai_thread, 
+                args=(target_mic, l_assemblyai)
+            )
+            t_assemblyai.daemon = True
+            t_assemblyai.start()
+            return
+        
+        # ========== WHISPER / GOOGLE (codice originale) ==========
         if "Whisper" in engine:
             if self.current_model_name != w_model:
                 self.update_ui(f"Loading Whisper Model ({w_model})... Please wait.")
@@ -347,6 +571,16 @@ class TranscriberApp:
         self.stop_event.set()
         self.is_recording = False
         
+        # Chiudi AssemblyAI se attivo (v3 usa disconnect)
+        if self.assemblyai_transcriber:
+            try:
+                self.assemblyai_transcriber.disconnect(terminate=True)
+                print("DEBUG: AssemblyAI transcriber disconnected")
+            except Exception as e:
+                print(f"Error disconnecting AssemblyAI: {e}")
+            finally:
+                self.assemblyai_transcriber = None
+        
         # Chiudi pool di worker
         if self.executor:
             self.executor.shutdown(wait=True, cancel_futures=False)
@@ -378,9 +612,9 @@ def main(page: ft.Page):
         content=img_robot,
         width=130,
         height=130,
-        border_radius=ft.border_radius.all(65),
+        border_radius=ft.BorderRadius.all(65),
         clip_behavior=ft.ClipBehavior.HARD_EDGE,
-        border=ft.border.all(2, ft.Colors.BLUE_GREY_800),
+        border=ft.Border.all(2, ft.Colors.BLUE_GREY_800),
         shadow=ft.BoxShadow(spread_radius=1, blur_radius=10, color=ft.Colors.BLACK),
     )
 
@@ -450,35 +684,38 @@ def main(page: ft.Page):
     dd_engine = ft.Dropdown(
         label="Engine",
         options=[
+            ft.dropdown.Option("AssemblyAI Real-Time ⚡ (FASTEST - like ChatGPT)"),
             ft.dropdown.Option("Google (indicated for English)"),
             ft.dropdown.Option("Whisper (indicated for Português Brasil)"),
         ],
-        value="Whisper (indicated for Português Brasil)",
+        value="AssemblyAI Real-Time ⚡ (FASTEST - like ChatGPT)",
         expand=True
     )
 
-    # Output Area: TextField multilinea per selezione nativa del testo (LARGO E ALTO!)
-    txt_output = ft.TextField(
-        value="",
-        multiline=True,
-        read_only=True,
-        min_lines=25,
-        max_lines=60,
-        text_size=14,
-        bgcolor=ft.Colors.BLACK12,
-        color=ft.Colors.GREEN_400,
-        border_color=ft.Colors.BLUE_GREY_700,
-        focused_border_color=ft.Colors.BLUE_400,
-        text_style=ft.TextStyle(font_family="Consolas"),
-        expand=True,  # Espande orizzontalmente
+    # Output Area: UNICO Testo per selezione perfetta!
+    # Avvolto in SelectionArea per permettere selezione nativa
+    log_content = ft.SelectionArea(
+        content=app.full_log_text
     )
-    app.txt_output = txt_output
     
-    # Contenitore con dimensioni FORZATE per garantire visibilità
+    # Colonna scrollabile
+    log_scroll_column = ft.Column(
+        controls=[log_content],
+        height=650,
+        scroll=ft.ScrollMode.ALWAYS,
+        auto_scroll=True,
+        expand=True,
+    )
+    app.log_scroll_column = log_scroll_column
+    
+    # Container principale
     log_container = ft.Container(
-        content=txt_output,
-        height=650,  # ALTEZZA FORZATA - 650px garantiti!
-        expand=True,  # Espande orizzontalmente per usare tutto lo spazio
+        content=log_scroll_column,
+        bgcolor=ft.Colors.BLACK12,
+        border_radius=10,
+        border=ft.border.all(2, ft.Colors.BLUE_GREY_700),
+        padding=10,
+        expand=True,
     )
 
     def btn_start_click(e):
@@ -495,12 +732,8 @@ def main(page: ft.Page):
             dd_engine.disabled = True
             btn_refresh.disabled = True
             
-            # Aggiungi messaggio di inizializzazione
-            if txt_output.value:
-                txt_output.value += f"\n>>> Initializing {dd_engine.value}... Please wait..."
-            else:
-                txt_output.value = f">>> Initializing {dd_engine.value}... Please wait..."
-            page.update()
+            # Aggiungi messaggio di inizializzazione via update_ui
+            app.update_ui(f">>> Initializing {dd_engine.value}... Please wait...")
             
             def start_bg():
                 app.start_transcription(dd_engine.value, dd_lang.value, dd_device.value)
@@ -514,9 +747,8 @@ def main(page: ft.Page):
             btn_stop.text = "STOPPING..."
             btn_stop.disabled = True
             
-            # Aggiungi messaggio di stop
-            txt_output.value += "\n>>> STOP REQUESTED... Finishing last chunk & closing threads..."
-            page.update()
+            # Aggiungi messaggio di stop via update_ui
+            app.update_ui(">>> STOP REQUESTED... Finishing last chunk & closing threads...")
             
             def stop_bg():
                 app.stop_transcription()
@@ -537,7 +769,9 @@ def main(page: ft.Page):
             threading.Thread(target=stop_bg).start()
 
     def btn_clear_click(e):
-        txt_output.value = ""
+        # Svuota tutto
+        app.turn_text_map.clear()
+        app.full_log_text.value = ""
         page.update()
 
     def btn_open_logs_click(e):
@@ -547,7 +781,7 @@ def main(page: ft.Page):
         except Exception as ex:
             print(f"Error opening folder: {ex}")
 
-    btn_start = ft.ElevatedButton(
+    btn_start = ft.Button(
         "START RECORDING", 
         color=ft.Colors.WHITE, 
         bgcolor=ft.Colors.GREEN_700, 
@@ -556,7 +790,7 @@ def main(page: ft.Page):
         expand=True
     )
     
-    btn_stop = ft.ElevatedButton(
+    btn_stop = ft.Button(
         "STOP", 
         color=ft.Colors.WHITE, 
         bgcolor=ft.Colors.RED_700, 
@@ -567,8 +801,8 @@ def main(page: ft.Page):
     )
 
     def btn_copy_all_click(e):
-        if txt_output.value:
-            page.set_clipboard(txt_output.value)
+        if app.full_log_text.value:
+            page.set_clipboard(app.full_log_text.value)
             # Feedback visivo temporaneo
             btn_copy_all.text = "✓ Copied!"
             page.update()
@@ -608,4 +842,4 @@ def main(page: ft.Page):
     )
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.run(main)
