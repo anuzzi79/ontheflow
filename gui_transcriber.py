@@ -10,6 +10,9 @@ from faster_whisper import WhisperModel
 import warnings
 import sys
 import os
+import json # #region debug log import
+# #endregion
+import asyncio  # Necessario per scroll ritardato
 from concurrent.futures import ThreadPoolExecutor
 import assemblyai as aai
 from assemblyai.streaming.v3 import (
@@ -64,7 +67,10 @@ class TranscriberApp:
         # Per gestire trascrizioni parziali (real-time)
         self.current_partial_text = ""
         self.last_turn_order = -1
-        self.turn_text_map = {}  # Mappa turn_order -> Testo stringa (non controlli UI)
+        self.turn_text_map = {}  # Mappa turn_order -> Testo stringa
+        self.translated_text_map = {} # Mappa turn_order -> Testo tradotto
+        self.turn_id_offset = 0  # Offset per garantire ordine tra sessioni
+        
         self.full_log_text = ft.Text(
             value="", 
             font_family="Consolas", 
@@ -73,9 +79,21 @@ class TranscriberApp:
             selectable=True
         )
         
+        self.full_translation_text = ft.Text(
+            value="", 
+            font_family="Consolas", 
+            size=14, 
+            color=ft.Colors.CYAN_400, # Colore diverso per traduzione
+            selectable=True
+        )
+    
         # Stato UI
         self.page = None
-        self.log_scroll_column = None # Colonna per auto-scroll
+        self.log_scroll_column = None # Colonna per auto-scroll (Trascrizione)
+        self.translation_scroll_column = None # Colonna per auto-scroll (Traduzione)
+        self.scroll_anchor = None # Ancora per lo scroll manuale
+        self.translation_scroll_anchor = None # Ancora per lo scroll manuale (Traduzione)
+
         
     def get_log_dir(self):
         docs = os.path.join(os.path.expanduser("~"), "Documents")
@@ -86,7 +104,7 @@ class TranscriberApp:
 
     def get_timestamp(self):
         return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
+    
     def log_to_file(self, text):
         if self.log_file:
             try:
@@ -94,6 +112,16 @@ class TranscriberApp:
                     f.write(text + "\n")
             except:
                 pass
+
+    def translate_text(self, text, target_lang="it"):
+        """Traduce il testo usando deep_translator (Google Translate)"""
+        try:
+            from deep_translator import GoogleTranslator
+            translated = GoogleTranslator(source='auto', target=target_lang).translate(text)
+            return translated
+        except Exception as e:
+            print(f"Translation Error: {e}")
+            return f"[Translation Error]"
 
     def record_audio_thread(self, mic, buffer_seconds):
         """Cattura audio e lo etichetta con chunk_id e timestamp di cattura"""
@@ -265,12 +293,6 @@ class TranscriberApp:
             print(f"Whisper Worker Error: {type(e).__name__}: {e}")
             return [f"[❌ Whisper Processing Failed]"]
 
-    def update_ui(self, text):
-        """Fallback per messaggi di sistema"""
-        self.log_to_file(text)
-        sys_id = 999999 + int(time.time()*1000)
-        self.update_or_add_line(text, True, sys_id)
-
     # ============== ASSEMBLYAI REAL-TIME STREAMING (v3 Universal) ==============
     
     def audio_generator(self, mic):
@@ -354,12 +376,14 @@ class TranscriberApp:
         print(f"AssemblyAI: Disconnected (processed {event.audio_duration_seconds:.1f}s)")
         self.update_ui("🔴 AssemblyAI Disconnected")
 
+    
     def on_assemblyai_turn(self, client, event: TurnEvent):
         """Callback: risultati REAL-TIME (parziali e finali)"""
         timestamp = self.get_timestamp()
         
-        # Logica infallibile basata su turn_order univoco
-        current_turn_id = event.turn_order
+        # Usa l'offset di sessione per garantire ordine cronologico globale
+        # AssemblyAI riparte da 0 a ogni connessione, noi aggiungiamo l'offset
+        current_turn_id = event.turn_order + self.turn_id_offset
         
         if event.end_of_turn:
             # FINE FRASE
@@ -369,6 +393,8 @@ class TranscriberApp:
                     is_final=True, 
                     turn_order=current_turn_id
                 )
+
+                    
         else:
             # TESTO PARZIALE
             if hasattr(event, 'words') and event.words:
@@ -385,42 +411,123 @@ class TranscriberApp:
         if self.page and self.full_log_text:
             try:
                 async def _do_update():
+                    # #region agent log
+                    try:
+                        with open(r"c:\Users\Antonio Nuzzi\ontheflow\.cursor\debug.log", "a") as f: 
+                            f.write(json.dumps({"sessionId": "debug-session", "timestamp": int(time.time()*1000), "location": "gui_transcriber.py:update_or_add_line", "message": "Start UI Update", "data": {"turn_order": turn_order, "text_len": len(text), "is_final": is_final}}) + "\n")
+                    except: pass
+                    # #endregion
+                    
                     # 1. Aggiorna la mappa dei testi
                     self.turn_text_map[turn_order] = text
                     
-                    # 2. Ricostruisci TUTTO il testo
-                    sorted_keys = sorted(self.turn_text_map.keys())
-                    
-                    # Ottimizzazione
-                    if len(sorted_keys) > 500:
-                        keys_to_remove = sorted_keys[:-500]
-                        for k in keys_to_remove:
-                            del self.turn_text_map[k]
-                        sorted_keys = sorted_keys[-500:]
-                    
-                    # Costruisci stringa unica
-                    full_content = "\n".join([self.turn_text_map[k] for k in sorted_keys])
-                    
-                    # 3. Aggiorna l'unico controllo Text
-                    self.full_log_text.value = full_content
-                    self.full_log_text.update()
-                    
-                    # 4. Scroll automatico
-                    if self.log_scroll_column:
-                        try:
-                            self.log_scroll_column.scroll_to(offset=-1, duration=50)
-                        except:
-                            pass
-                
+                    # Se è finale, traduci
+                    if is_final and turn_order not in self.translated_text_map:
+                         # Esegui traduzione in thread separato per non bloccare UI
+                        def translate_worker():
+                            # Pulisci il testo da timestamp e log prima di tradurre
+                            clean_text = text
+                            if "]" in text:
+                                try:
+                                    clean_text = text.split("]", 1)[1].strip()
+                                except:
+                                    pass
+                            
+                            # Ignora messaggi di sistema
+                            if clean_text.startswith(">>>") or clean_text.startswith("---") or clean_text.startswith("ERROR") or clean_text.startswith("⚠️"):
+                                translation = text # Copia i messaggi di sistema così come sono
+                            else:
+                                translation = self.translate_text(clean_text)
+                                # Aggiungi timestamp se presente nell'originale
+                                if "]" in text:
+                                    timestamp_part = text.split("]", 1)[0] + "]"
+                                    translation = f"{timestamp_part} {translation}"
+                            
+                            self.translated_text_map[turn_order] = translation
+                            self.trigger_ui_refresh() # Ridisegna UI dopo traduzione
+                            
+                        threading.Thread(target=translate_worker, daemon=True).start()
+
+                    self.trigger_ui_refresh() # Ridisegna UI immediato (trascrizione)
+
                 self.page.run_task(_do_update)
             except Exception as e:
                 print(f"UI Update Error: {e}")
 
+    def trigger_ui_refresh(self):
+        """Ricostruisce e aggiorna entrambe le colonne di testo"""
+        try:
+             # 2. Ricostruisci TUTTO il testo
+            sorted_keys = sorted(self.turn_text_map.keys())
+            
+            # Ottimizzazione
+            if len(sorted_keys) > 500:
+                keys_to_remove = sorted_keys[:-500]
+                for k in keys_to_remove:
+                    if k in self.turn_text_map: del self.turn_text_map[k]
+                    if k in self.translated_text_map: del self.translated_text_map[k]
+                sorted_keys = sorted_keys[-500:]
+            
+            # Costruisci stringa unica TRASCRIZIONE
+            full_content = "\n".join([self.turn_text_map[k] for k in sorted_keys])
+            self.full_log_text.value = full_content
+            self.full_log_text.update()
+
+            # Costruisci stringa unica TRADUZIONE
+            # Usa stringa vuota se la traduzione non è ancora pronta
+            full_translation = "\n".join([self.translated_text_map.get(k, "") for k in sorted_keys])
+            self.full_translation_text.value = full_translation
+            self.full_translation_text.update()
+
+            # 4. Scroll automatico: Strategia "Mano Invisibile" (Stacca e Riattacca)
+            self._scroll_column(self.log_scroll_column, self.scroll_anchor)
+            self._scroll_column(self.translation_scroll_column, self.translation_scroll_anchor)
+
+        except Exception as e:
+            print(f"Trigger UI Refresh Error: {e}")
+
+    def _scroll_column(self, column, anchor):
+        """Helper per gestire lo scroll automatico di una colonna"""
+        if column and anchor:
+            try:
+                # Rimuovi e riaggiungi l'ancora per forzare il layout a vederla "nuova" in fondo
+                if anchor in column.controls:
+                    column.controls.remove(anchor)
+                column.controls.append(anchor)
+                column.update() # Ridisegna la colonna
+                
+                # Scroll immediato verso l'ancora
+                column.scroll_to(key=anchor.key, duration=10)
+                
+                # Scroll ritardato di sicurezza
+                async def force_scroll_delayed():
+                    await asyncio.sleep(0.1) 
+                    if column:
+                        column.scroll_to(key=anchor.key, duration=10)
+                
+                self.page.run_task(force_scroll_delayed)
+            except Exception as e:
+                print(f"Scroll Helper Error: {e}")
+
     def update_ui(self, text):
-        """Fallback per messaggi di sistema"""
+        """Fallback per messaggi di sistema: usa ID sequenziale per apparire SOPRA le trascrizioni"""
         self.log_to_file(text)
-        sys_id = 999999 + int(time.time()*1000)
-        self.update_or_add_line(text, True, sys_id)
+        
+        # Calcola ID sequenziale corretto (max + 1) per garantire ordine cronologico
+        # Questo fa sì che i messaggi di sistema appaiano SOPRA le trascrizioni future
+        next_id = 0
+        if self.turn_text_map:
+            next_id = max(self.turn_text_map.keys()) + 1
+        else:
+            # Se siamo all'inizio, usa un valore base
+            next_id = 1
+            
+        # Assicurati che l'offset per le trascrizioni future sia maggiore di questo ID
+        # Le trascrizioni useranno (turn_order + turn_id_offset), quindi:
+        if self.turn_id_offset <= next_id:
+            self.turn_id_offset = next_id + 10
+            
+        self.update_or_add_line(text, True, next_id)
 
     def on_assemblyai_error(self, client, error: StreamingError):
         """Callback: errori"""
@@ -698,17 +805,34 @@ def main(page: ft.Page):
         content=app.full_log_text
     )
     
+    translation_content = ft.SelectionArea(
+        content=app.full_translation_text
+    )
+    
     # Colonna scrollabile
+    # Aggiungo un'ancora invisibile alla fine per lo scroll
+    scroll_anchor = ft.Container(height=1, key="scroll_anchor")
+    translation_scroll_anchor = ft.Container(height=1, key="translation_scroll_anchor")
+    
     log_scroll_column = ft.Column(
-        controls=[log_content],
-        height=650,
+        controls=[log_content, scroll_anchor],
         scroll=ft.ScrollMode.ALWAYS,
-        auto_scroll=True,
+        # auto_scroll rimosso per evitare conflitti con scroll manuale
         expand=True,
     )
-    app.log_scroll_column = log_scroll_column
     
-    # Container principale
+    translation_scroll_column = ft.Column(
+        controls=[translation_content, translation_scroll_anchor],
+        scroll=ft.ScrollMode.ALWAYS,
+        expand=True
+    )
+    
+    app.log_scroll_column = log_scroll_column
+    app.scroll_anchor = scroll_anchor
+    app.translation_scroll_column = translation_scroll_column
+    app.translation_scroll_anchor = translation_scroll_anchor
+    
+    # Container principale (Sinistra - Trascrizione)
     log_container = ft.Container(
         content=log_scroll_column,
         bgcolor=ft.Colors.BLACK12,
@@ -717,9 +841,43 @@ def main(page: ft.Page):
         padding=10,
         expand=True,
     )
+    
+    # Container secondario (Destra - Traduzione)
+    translation_container = ft.Container(
+        content=translation_scroll_column,
+        bgcolor=ft.Colors.BLACK12,
+        border_radius=10,
+        border=ft.border.all(2, ft.Colors.AMBER_900), # Bordo diverso
+        padding=10,
+        expand=True,
+    )
+
+    # Titoli colonne
+    col_header = ft.Row([
+        ft.Container(content=ft.Text("TRANSCRIPTION (Live)", weight="bold"), expand=True, alignment=ft.Alignment(0, 0)),
+        ft.Container(content=ft.Text("TRANSLATION (Italian)", weight="bold", color=ft.Colors.AMBER_400), expand=True, alignment=ft.Alignment(0, 0))
+    ])
+    
+    # Area principale divisa in due
+    split_view = ft.Row(
+        controls=[
+            log_container,
+            translation_container
+        ],
+        expand=True,
+        spacing=10
+    )
 
     def btn_start_click(e):
         if not app.is_recording:
+            # Calcola nuovo offset per mantenere ordine cronologico e posizionare i log sotto
+            current_max_id = 0
+            if app.turn_text_map:
+                current_max_id = max(app.turn_text_map.keys())
+            # Imposta offset molto alto rispetto all'ultimo ID usato
+            # Questo garantisce che i nuovi turni (0, 1, 2...) + offset siano > ultimo ID
+            app.turn_id_offset = current_max_id + 100000
+            
             img_robot.src = "robot_anim.gif"
             img_robot.update()
             
@@ -771,7 +929,9 @@ def main(page: ft.Page):
     def btn_clear_click(e):
         # Svuota tutto
         app.turn_text_map.clear()
+        app.translated_text_map.clear()
         app.full_log_text.value = ""
+        app.full_translation_text.value = ""
         page.update()
 
     def btn_open_logs_click(e):
@@ -830,7 +990,8 @@ def main(page: ft.Page):
         
         ft.Row([dd_device]),
         ft.Row([dd_lang, dd_engine]),
-        log_container, # CAMPO PRINCIPALE - 600px garantiti!
+        col_header,
+        split_view, # CAMPO PRINCIPALE - Split View
         ft.Text("💡 Select text with mouse + Ctrl+C, or 'Copy All'", 
                 size=10, 
                 color=ft.Colors.CYAN_600, 
