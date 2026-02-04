@@ -408,6 +408,10 @@ class TranscriberApp:
 
     def update_or_add_line(self, text, is_final, turn_order):
         """Aggiorna il testo UNICO ricostruendolo dalla mappa (garantisce ordine e unicità)"""
+        # FIX: Scrive su file se è una trascrizione finale (AssemblyAI bypassava update_ui)
+        if is_final:
+            self.log_to_file(text)
+
         if self.page and self.full_log_text:
             try:
                 async def _do_update():
@@ -511,7 +515,7 @@ class TranscriberApp:
 
     def update_ui(self, text):
         """Fallback per messaggi di sistema: usa ID sequenziale per apparire SOPRA le trascrizioni"""
-        self.log_to_file(text)
+        # self.log_to_file(text) -> Spostato in update_or_add_line per supportare anche AssemblyAI
         
         # Calcola ID sequenziale corretto (max + 1) per garantire ordine cronologico
         # Questo fa sì che i messaggi di sistema appaiano SOPRA le trascrizioni future
